@@ -49,8 +49,8 @@ import (
 	"io"
 	"sync"
 
-	log "github.com/golang/glog"
 	"context"
+	log "github.com/golang/glog"
 )
 
 // Client defines a set of methods which every client must implement.

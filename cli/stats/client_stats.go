@@ -1,29 +1,9 @@
-/*
-Copyright 2017 Google Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-// Package client contains transport implementation for the parent client
-// library using gnmi.proto.
-//
-// Note: this package should not be used directly. Use
-// github.com/openconfig/gnmi/client instead.
-package client
+package stats
 
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 	"time"
@@ -32,8 +12,6 @@ import (
 	log "github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
 	"github.com/openconfig/gnmi/client"
-	"github.com/openconfig/gnmi/client/grpcutil"
-	"github.com/openconfig/gnmi/path"
 	"github.com/openconfig/gnmi/value"
 	"github.com/openconfig/ygot/ygot"
 	"google.golang.org/grpc"
@@ -45,6 +23,11 @@ import (
 // Type defines the name resolution for this client type.
 const Type = "gnmi"
 
+type Record struct {
+	Rts []time.Time //request time stamp
+	Sts []time.Time //sync time stamp
+}
+
 // Client handles execution of the query and caching of its results.
 type Client struct {
 	conn      *grpc.ClientConn
@@ -54,30 +37,21 @@ type Client struct {
 	recv      client.ProtoHandler
 	handler   client.NotificationHandler
 	connected bool
+	Rd        Record
 }
 
 // New returns a new initialized client. If error is nil, returned Client has
 // established a connection to d. Close needs to be called for cleanup.
-func New(ctx context.Context, d client.Destination) (client.Impl, error) {
+func NewStatsClient(ctx context.Context, d client.Destination) (*Client, error) {
 	if len(d.Addrs) != 1 {
 		return nil, fmt.Errorf("d.Addrs must only contain one entry: %v", d.Addrs)
 	}
 	opts := []grpc.DialOption{
 		grpc.WithTimeout(d.Timeout),
 		grpc.WithBlock(),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
 	}
-
-	switch d.TLS {
-	case nil:
-		opts = append(opts, grpc.WithInsecure())
-	default:
+	if d.TLS != nil {
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(d.TLS)))
-	}
-
-	if d.Credentials != nil {
-		pc := newPassCred(d.Credentials.Username, d.Credentials.Password, true)
-		opts = append(opts, grpc.WithPerRPCCredentials(pc))
 	}
 	conn, err := grpc.DialContext(ctx, d.Addrs[0], opts...)
 	if err != nil {
@@ -88,17 +62,6 @@ func New(ctx context.Context, d client.Destination) (client.Impl, error) {
 
 // NewFromConn creates and returns the client based on the provided transport.
 func NewFromConn(ctx context.Context, conn *grpc.ClientConn, d client.Destination) (*Client, error) {
-	ok, err := grpcutil.Lookup(ctx, conn, "gnmi.gNMI")
-	if err != nil {
-		log.V(1).Infof("gRPC reflection lookup on %q for service gnmi.gNMI failed: %v", d.Addrs, err)
-		// This check is disabled for now. Reflection will become part of gNMI
-		// specification in the near future, so we can't enforce it yet.
-	}
-	if !ok {
-		// This check is disabled for now. Reflection will become part of gNMI
-		// specification in the near future, so we can't enforce it yet.
-	}
-
 	cl := gpb.NewGNMIClient(conn)
 	return &Client{
 		conn:   conn,
@@ -112,21 +75,19 @@ func (c *Client) Subscribe(ctx context.Context, q client.Query) error {
 	if err != nil {
 		return fmt.Errorf("gpb.GNMIClient.Subscribe(%v) failed to initialize Subscribe RPC: %v", q, err)
 	}
-
-	sr := q.SubReq
-	if sr == nil {
-		sr, err = subscribe(q)
-		if err != nil {
-			return fmt.Errorf("generating SubscribeRequest proto: %v", err)
-		}
+	qq, err := subscribe(q)
+	if err != nil {
+		return fmt.Errorf("generating SubscribeRequest proto: %v", err)
 	}
-
-	if err := sub.Send(sr); err != nil {
-		return fmt.Errorf("client.Send(%+v): %v", sr, err)
+	if err := sub.Send(qq); err != nil {
+		return fmt.Errorf("client.Send(%+v): %v", qq, err)
 	}
 
 	c.sub = sub
 	c.query = q
+
+	c.Rd.Rts = append(c.Rd.Rts, time.Now())
+	log.V(3).Infof("Subscribe:  c.Rd %v", c.Rd)
 	if q.ProtoHandler == nil {
 		c.recv = c.defaultRecv
 		c.handler = q.NotificationHandler
@@ -141,6 +102,8 @@ func (c *Client) Poll() error {
 	if err := c.sub.Send(&gpb.SubscribeRequest{Request: &gpb.SubscribeRequest_Poll{Poll: &gpb.Poll{}}}); err != nil {
 		return fmt.Errorf("client.Poll(): %v", err)
 	}
+	c.Rd.Rts = append(c.Rd.Rts, time.Now())
+	log.V(3).Infof("Poll:  c.Rd %v", c.Rd)
 	return nil
 }
 
@@ -153,6 +116,9 @@ func (c *Client) Peer() string {
 // Close forcefully closes the underlying connection, terminating the query
 // right away. It's safe to call Close multiple times.
 func (c *Client) Close() error {
+	if c.conn == nil {
+		return nil
+	}
 	return c.conn.Close()
 }
 
@@ -163,7 +129,39 @@ func (c *Client) Recv() error {
 	if err != nil {
 		return err
 	}
+	log.V(3).Infof("Recv:  n %v", n)
 	return c.recv(n)
+}
+
+func (c *Client) RecvAll() error {
+	for {
+		err := c.Recv()
+		switch err {
+		default:
+			log.V(1).Infof("RecvAll received unknown error: %v", err)
+			c.Close()
+			return err
+		case io.EOF, client.ErrStopReading:
+			log.V(3).Infof("RecvAll stop marker: %v", err)
+			return nil
+		case nil:
+		}
+
+		// Close fast, so that we don't deliver any buffered updates.
+		//
+		// Note: this approach still allows at most 1 update through after
+		// Close. A more thorough solution would be to do the check at
+		// Notification/ProtoHandler or Impl level, but that would involve much
+		// more work.
+		/*
+			c.mu.RLock()
+			closed := c.closed
+			c.mu.RUnlock()
+			if closed {
+				return nil
+			}
+		*/
+	}
 }
 
 // defaultRecv is the default implementation of recv provided by the client.
@@ -179,7 +177,7 @@ func (c *Client) defaultRecv(msg proto.Message) error {
 	if !ok {
 		return fmt.Errorf("failed to type assert message %#v", msg)
 	}
-	log.V(1).Info(resp)
+	log.V(5).Info(resp)
 	switch v := resp.Response.(type) {
 	default:
 		return fmt.Errorf("unknown response %T: %s", v, v)
@@ -187,13 +185,21 @@ func (c *Client) defaultRecv(msg proto.Message) error {
 		return fmt.Errorf("error in response: %s", v)
 	case *gpb.SubscribeResponse_SyncResponse:
 		c.handler(client.Sync{})
+		c.Rd.Sts = append(c.Rd.Sts, time.Now())
+		log.V(5).Infof("defaultRecv:  c.Rd %v", c.Rd)
 		if c.query.Type == client.Poll || c.query.Type == client.Once {
 			return client.ErrStopReading
 		}
 	case *gpb.SubscribeResponse_Update:
 		n := v.Update
-		// skip target from path prefix with parameter "false"
-		p := path.ToStrings(n.Prefix, false)
+		var p []string
+		if n.Prefix != nil {
+			var err error
+			p, err = ygot.PathToStrings(n.Prefix)
+			if err != nil {
+				return err
+			}
+		}
 		ts := time.Unix(0, n.Timestamp)
 		for _, u := range n.Update {
 			if u.Path == nil {
@@ -216,21 +222,6 @@ func (c *Client) defaultRecv(msg proto.Message) error {
 	return nil
 }
 
-// Capabilities calls the gNMI Capabilities RPC.
-func (c *Client) Capabilities(ctx context.Context, r *gpb.CapabilityRequest) (*gpb.CapabilityResponse, error) {
-	return c.client.Capabilities(ctx, r)
-}
-
-// Get calls the gNMI Get RPC.
-func (c *Client) Get(ctx context.Context, r *gpb.GetRequest) (*gpb.GetResponse, error) {
-	return c.client.Get(ctx, r)
-}
-
-// Set calls the gNMI Set RPC.
-func (c *Client) Set(ctx context.Context, r *gpb.SetRequest) (*gpb.SetResponse, error) {
-	return c.client.Set(ctx, r)
-}
-
 func getType(t client.Type) gpb.SubscriptionList_Mode {
 	switch t {
 	case client.Once:
@@ -249,9 +240,6 @@ func subscribe(q client.Query) (*gpb.SubscribeRequest, error) {
 			Mode:   getType(q.Type),
 			Prefix: &gpb.Path{Target: q.Target},
 		},
-	}
-	if q.UpdatesOnly {
-		s.Subscribe.UpdatesOnly = true
 	}
 	for _, qq := range q.Queries {
 		pp, err := ygot.StringToPath(pathToString(qq), ygot.StructuredPath, ygot.StringSlicePath)
@@ -300,10 +288,10 @@ func toScalar(tv *gpb.TypedValue) (interface{}, error) {
 	case *gpb.TypedValue_BytesVal:
 		i = tv.GetBytesVal()
 	case *gpb.TypedValue_JsonIetfVal:
-		var val interface{}
-		val = tv.GetJsonIetfVal()
-		json.Unmarshal(val.([]byte), &i)
-		//i = tv.GetJsonIetfVal()
+		//var val interface{}
+		//val = tv.GetJsonIetfVal()
+		//json.Unmarshal(val.([]byte), &i)
+		i = tv.GetJsonIetfVal()
 	default:
 		return nil, fmt.Errorf("non-scalar type %+v", tv.Value)
 	}
@@ -311,7 +299,10 @@ func toScalar(tv *gpb.TypedValue) (interface{}, error) {
 }
 
 func noti(prefix []string, pp *gpb.Path, ts time.Time, u *gpb.Update) (client.Notification, error) {
-	sp := path.ToStrings(pp, false)
+	sp, err := ygot.PathToStrings(pp)
+	if err != nil {
+		return nil, fmt.Errorf("converting path %v to []string: %v", u.GetPath(), err)
+	}
 	// Make a full new copy of prefix + u.Path to avoid any reuse of underlying
 	// slice arrays.
 	p := make([]string, 0, len(prefix)+len(sp))
@@ -326,24 +317,20 @@ func noti(prefix []string, pp *gpb.Path, ts time.Time, u *gpb.Update) (client.No
 		if err != nil {
 			return nil, err
 		}
-		return client.Update{Path: p, TS: ts, Val: val, Dups: u.Duplicates}, nil
+		return client.Update{Path: p, TS: ts, Val: val}, nil
 	}
 	switch v := u.Value; v.Type {
 	case gpb.Encoding_BYTES:
-		return client.Update{Path: p, TS: ts, Val: v.Value, Dups: u.Duplicates}, nil
+		return client.Update{Path: p, TS: ts, Val: v.Value}, nil
 	case gpb.Encoding_JSON, gpb.Encoding_JSON_IETF:
 		var val interface{}
 		if err := json.Unmarshal(v.Value, &val); err != nil {
 			return nil, fmt.Errorf("json.Unmarshal(%q, val): %v", v, err)
 		}
-		return client.Update{Path: p, TS: ts, Val: val, Dups: u.Duplicates}, nil
+		return client.Update{Path: p, TS: ts, Val: val}, nil
 	default:
 		return nil, fmt.Errorf("Unsupported value type: %v", v.Type)
 	}
-}
-
-func init() {
-	client.Register(Type, New)
 }
 
 // ProtoResponse converts client library Notification types into gNMI
@@ -358,6 +345,7 @@ func ProtoResponse(notifs ...client.Notification) (*gpb.SubscribeResponse, error
 			if n.Timestamp == 0 {
 				n.Timestamp = nn.TS.UnixNano()
 			}
+
 			pp, err := ygot.StringToPath(pathToString(nn.Path), ygot.StructuredPath, ygot.StringSlicePath)
 			if err != nil {
 				return nil, err

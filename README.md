@@ -15,7 +15,7 @@ The implementations include:
 
 To install the CLI, run
 
-    go get -u github.com/openconfig/gnmi/cmd/gnmi_cli
+    go get -u github.com/zhenggen-xu/gnmi/cmd/gnmi_cli
 
 ## Client libraries
 
